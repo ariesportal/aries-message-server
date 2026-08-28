@@ -64,8 +64,16 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+  // added for online status + unread notification badges — IF NOT EXISTS
+  // makes these safe to run every time the server starts, including on
+  // a database that already has the older table shape.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ DEFAULT now();`);
   console.log("Database tables ready.");
 }
+
+// how recently someone must have sent a heartbeat to count as "online"
+const ONLINE_WINDOW_SECONDS = 45;
 
 // ---- auth middleware ----
 function requireAuth(req, res, next) {
@@ -131,14 +139,28 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
+// ---- heartbeat: call this every ~20s while the messenger is open, so
+// other people can see you as "online" (green dot) ----
+app.post("/api/heartbeat", requireAuth, async (req, res) => {
+  try {
+    await pool.query("UPDATE users SET last_seen = now() WHERE id = $1", [req.user.uid]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error updating heartbeat: " + e.message });
+  }
+});
+
 // ---- list all other users (for starting new conversations) ----
 app.get("/api/users", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, display_name FROM users WHERE id != $1 ORDER BY display_name ASC",
+      `SELECT id, display_name,
+              (last_seen IS NOT NULL AND last_seen > now() - interval '${ONLINE_WINDOW_SECONDS} seconds') AS online
+       FROM users WHERE id != $1 ORDER BY display_name ASC`,
       [req.user.uid]
     );
-    res.json(result.rows.map((r) => ({ uid: r.id, name: r.display_name })));
+    res.json(result.rows.map((r) => ({ uid: r.id, name: r.display_name, online: r.online })));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error loading users: " + e.message });
@@ -151,7 +173,17 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT c.id, c.type, c.name, c.last_message, c.last_message_at,
               array_agg(cm2.user_id) AS member_ids,
-              array_agg(u2.display_name) AS member_names
+              array_agg(u2.display_name) AS member_names,
+              array_agg(u2.last_seen) AS member_last_seen,
+              (SELECT last_read_at FROM conversation_members WHERE conversation_id = c.id AND user_id = $1) AS my_last_read,
+              (SELECT COUNT(*) FROM messages m
+                 WHERE m.conversation_id = c.id
+                   AND m.sender_id != $1
+                   AND m.created_at > COALESCE(
+                     (SELECT last_read_at FROM conversation_members WHERE conversation_id = c.id AND user_id = $1),
+                     '1970-01-01'::timestamptz
+                   )
+              ) AS unread_count
        FROM conversations c
        JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = $1
        JOIN conversation_members cm2 ON cm2.conversation_id = c.id
@@ -162,21 +194,43 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
     );
     const convos = result.rows.map((c) => {
       let displayName = c.name;
+      let online = false;
       if (c.type === "dm") {
         const idx = c.member_ids.findIndex((id) => id !== req.user.uid);
         displayName = c.member_names[idx] || "Direct Message";
+        const otherLastSeen = c.member_last_seen[idx];
+        online = !!otherLastSeen && (Date.now() - new Date(otherLastSeen).getTime()) / 1000 < ONLINE_WINDOW_SECONDS;
       }
       return {
         id: c.id,
         type: c.type,
         name: displayName || "Group Chat",
         lastMessage: c.last_message,
+        unreadCount: parseInt(c.unread_count, 10) || 0,
+        online: online,
       };
     });
     res.json(convos);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error loading conversations: " + e.message });
+  }
+});
+
+// ---- mark a conversation as read (clears its unread badge) ----
+app.post("/api/conversations/:id/read", requireAuth, async (req, res) => {
+  try {
+    const convoId = req.params.id;
+    await pool.query(
+      `INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (conversation_id, user_id) DO UPDATE SET last_read_at = now()`,
+      [convoId, req.user.uid]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error marking conversation read: " + e.message });
   }
 });
 
