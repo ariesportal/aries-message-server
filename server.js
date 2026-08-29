@@ -1,465 +1,500 @@
-<!-- ===================================================================
-     A.R.I.E.S. Digital Intake Form — Squarespace Code Block
+// ===================================================================
+// A.R.I.E.S. Hub Backend — Message Center + Member Dashboard +
+// Intake Form Email Submission
+// Deploy this on Render.com (see render.yaml + setup instructions).
+//
+// This uses simple REST endpoints + polling on the frontend (not
+// WebSockets) — a bit less instantaneous than true real-time, but far
+// more reliable and easier to debug, which matters a lot after the
+// Firebase troubleshooting marathon this replaced.
+//
+// ===================================================================
+// GMAIL SETUP — do this once, for the intake form's auto-email
+// ===================================================================
+// 1. Go to myaccount.google.com/security on the Gmail account you
+//    want to SEND from (can be ariesportalinquiries@gmail.com itself,
+//    or a different Gmail account — either works).
+// 2. Turn on "2-Step Verification" if it isn't already on.
+// 3. Scroll to the bottom of that Security page → "App passwords" →
+//    create one (name it anything, e.g. "ARIES Intake Form") → Google
+//    gives you a 16-character code. Copy it (remove any spaces).
+// 4. In Render: Environment → add two variables:
+//      GMAIL_USER = the full Gmail address you're sending FROM
+//      GMAIL_APP_PASSWORD = the 16-character code from step 3
+//    NEVER put these in frontend code or share them in chat.
+// ===================================================================
 
-     This goes on its own dedicated page (create a new page in
-     Squarespace — can be unlisted/hidden from navigation if you'd
-     rather only share it via direct link — then add a Code Block to
-     that page's content area and paste this whole thing in).
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
 
-     Fully self-contained — no login, no backend, nothing saved
-     anywhere automatically. The member fills it out, then either:
-       - Clicks "PRINT / SAVE AS PDF" to generate a real PDF via their
-         browser's own print dialog (choosing "Save as PDF" as the
-         destination), then attaches that PDF to an email to you, OR
-       - Clicks "COPY SUMMARY" to copy a clean text version to their
-         clipboard, then pastes it directly into an email body to you.
-     Either way, sending it back to A.R.I.E.S. is still a manual step —
-     this just makes filling it out and generating a copy easier than
-     the original static PDF.
-=================================================================== -->
-<style>
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-  /* =====================================================
-     A.R.I.E.S. Digital Intake Form
-     Fully self-contained — no login, no backend, nothing saved
-     anywhere automatically. Fill it out, then either:
-       - Click "PRINT / SAVE AS PDF" to generate a real PDF via your
-         browser's own print dialog (choose "Save as PDF" as the
-         destination), then attach that PDF to an email, OR
-       - Click "COPY SUMMARY" to copy a clean text version to your
-         clipboard, then paste it directly into an email body.
-     Either way, sending it to A.R.I.E.S. is still a manual step —
-     this just makes filling it out and generating your copy easier
-     than the original static PDF.
-  ===================================================== */
-  * { box-sizing: border-box; }
-  body {
-    background: #000000;
-    color: #ffd400;
-    font-family: 'Courier New', monospace;
-    margin: 0;
-    padding: 30px 16px 80px;
-  }
-  #wrap { max-width: 800px; margin: 0 auto; }
-  header { text-align: center; margin-bottom: 30px; }
-  header h1 { font-size: 20px; letter-spacing: 1px; margin-bottom: 6px; }
-  header p { font-size: 11px; opacity: 0.7; letter-spacing: 1px; text-transform: uppercase; }
-  .note-banner {
-    background: #0a0900;
-    border: 1px solid rgba(255,212,0,0.35);
-    border-radius: 10px;
-    padding: 14px 16px;
-    font-size: 11px;
-    line-height: 1.6;
-    margin-bottom: 26px;
-  }
-  section { margin-bottom: 30px; }
-  .section-title {
-    font-size: 13px;
-    font-weight: bold;
-    letter-spacing: 1.5px;
-    color: #ffd400;
-    border-bottom: 1px solid rgba(255,212,0,0.3);
-    padding-bottom: 8px;
-    margin-bottom: 6px;
-  }
-  .section-hint { font-size: 10px; opacity: 0.55; margin-bottom: 14px; line-height: 1.5; }
-  .field { margin-bottom: 14px; }
-  .field label { display: block; font-size: 10.5px; letter-spacing: 0.5px; opacity: 0.75; margin-bottom: 5px; }
-  input[type="text"], input[type="email"], input[type="tel"], input[type="date"], textarea {
-    width: 100%;
-    background: #0a0900;
-    border: 1px solid rgba(255,212,0,0.4);
-    color: #ffd400;
-    font-family: 'Courier New', monospace;
-    font-size: 12px;
-    padding: 9px 12px;
-    border-radius: 6px;
-    outline: none;
-  }
-  textarea { min-height: 60px; resize: vertical; }
-  .radio-row, .checkbox-row { display: flex; flex-wrap: wrap; gap: 8px 18px; }
-  .checkbox-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px 16px; }
-  .radio-item, .checkbox-item { display: flex; align-items: center; gap: 6px; font-size: 11px; }
-  .radio-item input, .checkbox-item input { width: auto; }
-  #actions {
-    position: sticky;
-    bottom: 0;
-    background: #000000;
-    border-top: 1px solid rgba(255,212,0,0.3);
-    padding: 16px;
-    display: flex;
-    gap: 10px;
-    justify-content: center;
-    margin-top: 30px;
-  }
-  #actions button {
-    font-family: 'Courier New', monospace;
-    font-weight: bold;
-    font-size: 12px;
-    letter-spacing: 0.5px;
-    padding: 12px 22px;
-    border-radius: 999px;
-    cursor: pointer;
-    border: none;
-  }
-  #printBtn { background: #ffd400; color: #000; }
-  #copyBtn { background: transparent; color: #ffd400; border: 1px solid rgba(255,212,0,0.5) !important; }
-  #copyConfirm { font-size: 10px; color: #7CFC00; text-align: center; margin-top: 8px; min-height: 14px; }
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-in-render-env-vars";
+const PORT = process.env.PORT || 3000;
 
-  /* ---- print styling: switch to a clean printable document ---- */
-  @media print {
-    body { background: #ffffff; color: #000000; padding: 0; }
-    .note-banner { display: none; }
-    #actions { display: none; }
-    #copyConfirm { display: none; }
-    input, textarea {
-      background: #ffffff; color: #000000; border: 1px solid #999999;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+const mailTransporter = nodemailer.createTransport({
+  host: "smtp.gmail.com",
+  port: 587,
+  secure: false,
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD,
+  },
+});
+
+// where completed intake forms get sent
+const INTAKE_RECIPIENT = "ariesportalinquiries@gmail.com";
+
+// ---- one-time table setup, runs automatically on every server start ----
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL,
+      name TEXT,
+      last_message TEXT,
+      last_message_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversation_members (
+      conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      PRIMARY KEY (conversation_id, user_id)
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+      sender_id INTEGER REFERENCES users(id),
+      sender_name TEXT,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  // added for online status + unread notification badges — IF NOT EXISTS
+  // makes these safe to run every time the server starts, including on
+  // a database that already has the older table shape.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ DEFAULT now();`);
+  // private per-member case notes, added for the member dashboard
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  console.log("Database tables ready.");
+}
+
+// how recently someone must have sent a heartbeat to count as "online"
+const ONLINE_WINDOW_SECONDS = 45;
+
+// ---- auth middleware ----
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing auth token" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// ---- health check (visit this URL in a browser to confirm the server is alive) ----
+app.get("/", (req, res) => {
+  res.json({ status: "ok", message: "A.R.I.E.S. message server is running." });
+});
+
+// ---- sign up ----
+app.post("/api/signup", async (req, res) => {
+  try {
+    const { email, password, displayName } = req.body;
+    if (!email || !password || !displayName) {
+      return res.status(400).json({ error: "Email, password, and display name are all required." });
     }
-    .section-title { color: #000000; border-bottom-color: #000000; }
-    section { page-break-inside: avoid; }
-  }
-</style>
-
-<div id="wrap">
-  <header>
-    <h1>A.R.I.E.S. PORTAL — INVESTIGATOR &amp; COMPANY INTAKE FORM</h1>
-    <p>Advanced Research &amp; Investigation Evidence Services</p>
-  </header>
-
-  <div class="note-banner">
-    Fill out the sections below, then click "SUBMIT FORM" — this sends your
-    completed form directly to A.R.I.E.S. by email. You can also click
-    "DOWNLOAD PDF" first to keep your own copy for your records.
-  </div>
-
-  <form id="intakeForm"></form>
-
-  <!-- hidden honeypot field: invisible to real people, but bots that
-       auto-fill every field on a page will often fill this in too,
-       letting us quietly discard likely-spam submissions -->
-  <input type="text" id="honeypot" name="honeypot" autocomplete="off" style="position:absolute;left:-9999px;" tabindex="-1" aria-hidden="true">
-
-  <div id="actions">
-    <button type="button" id="printBtn">DOWNLOAD PDF (OPTIONAL)</button>
-    <button type="button" id="submitBtn">SUBMIT FORM</button>
-  </div>
-  <div id="submitStatus"></div>
-</div>
-
-<script>
-(function () {
-  // =========================================================
-  // SCHEMA — matches the original A.R.I.E.S. Investigator &
-  // Company Intake Form. Section 11 (staff-only verification) is
-  // intentionally left out — that's for A.R.I.E.S. internal review
-  // after you receive the completed form back, not something the
-  // member fills in.
-  // =========================================================
-  var SCHEMA = [
-    { title: "1. Membership Information", fields: [
-      { key: "membershipTier", label: "Membership Tier", type: "checkboxes", options: ["Standard Investigator", "Premium Investigator", "Standard Company", "Premium Company"] },
-      { key: "investigatorOrCompanyName", label: "Investigator / Company Name", type: "text" },
-      { key: "primaryContactName", label: "Primary Contact Name", type: "text" },
-      { key: "title", label: "Title / Position", type: "text" },
-      { key: "primaryContactEmail", label: "Primary Contact Email", type: "email" },
-      { key: "primaryContactPhone", label: "Primary Contact Phone", type: "tel" }
-    ]},
-    { title: "2. Investigator / Company Information", hint: "Private investigators: skip company-specific fields that do not apply to your individual practice. Enter \u201cN/A\u201d if a field doesn't apply.", fields: [
-      { key: "companyName", label: "Company / Professional Name", type: "text" },
-      { key: "companyWebsite", label: "Company Website", type: "text" },
-      { key: "primaryOfficeAddress", label: "Primary Office Address", type: "text" },
-      { key: "cityStateZip", label: "City / State / ZIP", type: "text" },
-      { key: "county", label: "County", type: "text" },
-      { key: "mainOfficePhone", label: "Main Office Phone", type: "tel" },
-      { key: "salesPhone", label: "Sales / Business Development Phone", type: "tel" },
-      { key: "regionalOfficePhone", label: "Regional Office Phone", type: "tel" },
-      { key: "faxNumber", label: "Fax Number", type: "tel" },
-      { key: "generalCompanyEmail", label: "General Company Email", type: "email" },
-      { key: "salesEmail", label: "Sales / Business Development Email", type: "email" }
-    ]},
-    { title: "3. Multiple Field Offices", hint: "Skip this section if you do not operate multiple field offices.", fields: [
-      { key: "hasMultipleOffices", label: "Does your company operate multiple field offices?", type: "radio", options: ["No — Single Office", "Yes — Multiple Field Offices"] },
-      { key: "numFieldOffices", label: "Approximate Number of Field Offices", type: "text" },
-      { key: "fieldOfficesContact", label: "Primary Contact for Field Offices", type: "text" },
-      { key: "fieldOfficesEmail", label: "Email", type: "email" },
-      { key: "fieldOfficesPhone", label: "Phone", type: "tel" },
-      { key: "statesWithFieldOffices", label: "States With Field Offices", type: "text" }
-    ]},
-    { title: "4. Service Area", fields: [
-      { key: "serviceArea", label: "Service Area", type: "checkboxes", options: ["Local", "Regional", "Statewide", "Multi-State", "Nationwide"] },
-      { key: "statesServed", label: "States Served", type: "textarea" },
-      { key: "citiesCountiesServed", label: "Cities / Counties Served", type: "textarea" }
-    ]},
-    { title: "5. Investigative Services", fields: [
-      { key: "services", label: "Services Offered", type: "checkboxes", options: [
-        "Surveillance", "Workers' Compensation Investigations", "Insurance Investigations", "Liability Investigations",
-        "Infidelity Investigations", "Background Investigations", "Skip Tracing / Locate Services", "Missing Persons",
-        "Asset Searches", "Fraud Investigations", "Corporate Investigations", "Employment Investigations",
-        "Internal Investigations", "Criminal Defense Investigations", "Civil Investigations", "Family / Domestic Investigations",
-        "Child Custody Investigations", "Process Serving", "Witness Locating", "Statement / Interview Services",
-        "Undercover Investigations", "Counter-Surveillance", "Digital Investigations", "Cyber Investigations",
-        "Computer / Mobile Forensics", "Social Media Investigations", "Accident Investigations", "Accident Reconstruction",
-        "Due Diligence Investigations", "Litigation Support", "Recorded Statements", "Photography / Videography",
-        "GPS / Tracking Services", "Mystery Shopping", "Retail Investigations", "SIU Services", "Security Consulting"
-      ]},
-      { key: "otherService", label: "Other Service", type: "text" },
-      { key: "additionalServices", label: "Additional Services / Specialties", type: "textarea" }
-    ]},
-    { title: "6. Professional Information", fields: [
-      { key: "yearsInBusiness", label: "Years in Business / Years Practicing", type: "text" },
-      { key: "professionalSpecialties", label: "Professional Specialties", type: "textarea" },
-      { key: "professionalCertifications", label: "Professional Certifications", type: "textarea" },
-      { key: "professionalAssociations", label: "Professional Associations", type: "textarea" },
-      { key: "languagesSpoken", label: "Additional Languages Spoken", type: "text" }
-    ]},
-    { title: "7. License & Verification Information", fields: [
-      { key: "licenseRequired", label: "Is a professional or investigative license required for your services in your state?", type: "radio", options: ["Yes", "No", "Not Applicable"] },
-      { key: "licenseNumber", label: "License / Registration Number", type: "text" },
-      { key: "issuingState", label: "Issuing State", type: "text" },
-      { key: "licenseExpiration", label: "License Expiration Date", type: "date" },
-      { key: "additionalLicenseInfo", label: "Additional License Information", type: "textarea" },
-      { key: "licenseDocNote", label: "License / Verification Documentation", type: "note", note: "Please attach your license documentation as a separate file with your email." }
-    ]},
-    { title: "8. Company Rating & Online Reviews", hint: "Skip company-specific rating fields if they do not apply to your individual practice.", fields: [
-      { key: "googleRating", label: "Google — Rating / Grade", type: "text" },
-      { key: "googleReviews", label: "Google — Number of Reviews", type: "text" },
-      { key: "googleLink", label: "Google — Profile / Review Link", type: "text" },
-      { key: "yelpRating", label: "Yelp — Rating / Grade", type: "text" },
-      { key: "yelpReviews", label: "Yelp — Number of Reviews", type: "text" },
-      { key: "yelpLink", label: "Yelp — Profile / Review Link", type: "text" },
-      { key: "bbbRating", label: "Better Business Bureau — Rating / Grade", type: "text" },
-      { key: "bbbReviews", label: "BBB — Number of Reviews", type: "text" },
-      { key: "bbbLink", label: "BBB — Profile / Review Link", type: "text" },
-      { key: "otherReviewPlatform", label: "Other Review Platform Name", type: "text" },
-      { key: "otherRating", label: "Other — Rating / Grade", type: "text" },
-      { key: "otherReviews", label: "Other — Number of Reviews", type: "text" },
-      { key: "otherLink", label: "Other — Profile / Review Link", type: "text" }
-    ]},
-    { title: "9. Directory Listing", fields: [
-      { key: "publicListingName", label: "Public Listing Name", type: "text" },
-      { key: "publicPhone", label: "Public Phone Number", type: "tel" },
-      { key: "publicEmail", label: "Public Email", type: "email" },
-      { key: "publicWebsite", label: "Public Website", type: "text" },
-      { key: "addressDisplay", label: "Address Display", type: "radio", options: ["Display Full Address", "Display City / State Only"] },
-      { key: "description", label: "Company / Investigator Description", type: "textarea" },
-      { key: "logoNote", label: "Company / Investigator Logo", type: "note", note: "Please attach your logo file as a separate file with your email." }
-    ]},
-    { title: "10. Social Media & Online Presence", fields: [
-      { key: "facebook", label: "Facebook", type: "text" },
-      { key: "linkedin", label: "LinkedIn", type: "text" },
-      { key: "instagram", label: "Instagram", type: "text" },
-      { key: "otherSocial", label: "Other", type: "text" },
-      { key: "additionalProfiles", label: "Additional Online Profiles / Links", type: "textarea" }
-    ]},
-    { title: "11. Member Certification", hint: "By submitting this form, you confirm: the information provided is accurate and current to the best of your knowledge; you understand A.R.I.E.S. may review and verify submitted information; you authorize A.R.I.E.S. Portal to use this information to create and maintain your directory listing; you understand submission does not guarantee publication of every item; and you understand A.R.I.E.S. may contact you if additional information or documentation is required.", fields: [
-      { key: "certName", label: "Name", type: "text" },
-      { key: "certTitle", label: "Title", type: "text" },
-      { key: "certSignature", label: "Electronic Signature (type your full name)", type: "text" },
-      { key: "certDate", label: "Date", type: "date" },
-      { key: "certAgree", label: "I certify the above statements are true and agree to the terms above", type: "singleCheckbox" }
-    ]}
-  ];
-  // =========================================================
-
-  function fieldId(key) { return "field-" + key; }
-
-  var form = document.getElementById("intakeForm");
-  SCHEMA.forEach(function (section) {
-    var sectionEl = document.createElement("section");
-
-    var titleEl = document.createElement("div");
-    titleEl.className = "section-title";
-    titleEl.textContent = section.title;
-    sectionEl.appendChild(titleEl);
-
-    if (section.hint) {
-      var hintEl = document.createElement("div");
-      hintEl.className = "section-hint";
-      hintEl.textContent = section.hint;
-      sectionEl.appendChild(hintEl);
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: "That email is already registered." });
     }
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      "INSERT INTO users (email, password_hash, display_name) VALUES ($1, $2, $3) RETURNING id, display_name",
+      [email, hash, displayName]
+    );
+    const user = result.rows[0];
+    const token = jwt.sign({ uid: user.id, displayName: user.display_name }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, uid: user.id, displayName: user.display_name });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error during signup: " + e.message });
+  }
+});
 
-    section.fields.forEach(function (field) {
-      sectionEl.appendChild(renderField(field));
+// ---- log in ----
+app.post("/api/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: "No account found with that email." });
+    }
+    const user = result.rows[0];
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.status(400).json({ error: "Incorrect password." });
+    }
+    const token = jwt.sign({ uid: user.id, displayName: user.display_name }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, uid: user.id, displayName: user.display_name });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error during login: " + e.message });
+  }
+});
+
+// ---- heartbeat: call this every ~20s while the messenger is open, so
+// other people can see you as "online" (green dot) ----
+app.post("/api/heartbeat", requireAuth, async (req, res) => {
+  try {
+    await pool.query("UPDATE users SET last_seen = now() WHERE id = $1", [req.user.uid]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error updating heartbeat: " + e.message });
+  }
+});
+
+// ---- list all other users (for starting new conversations) ----
+app.get("/api/users", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, display_name,
+              (last_seen IS NOT NULL AND last_seen > now() - interval '${ONLINE_WINDOW_SECONDS} seconds') AS online
+       FROM users WHERE id != $1 ORDER BY display_name ASC`,
+      [req.user.uid]
+    );
+    res.json(result.rows.map((r) => ({ uid: r.id, name: r.display_name, online: r.online })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading users: " + e.message });
+  }
+});
+
+// ---- list my conversations ----
+app.get("/api/conversations", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT c.id, c.type, c.name, c.last_message, c.last_message_at,
+              array_agg(cm2.user_id) AS member_ids,
+              array_agg(u2.display_name) AS member_names,
+              array_agg(u2.last_seen) AS member_last_seen,
+              (SELECT last_read_at FROM conversation_members WHERE conversation_id = c.id AND user_id = $1) AS my_last_read,
+              (SELECT COUNT(*) FROM messages m
+                 WHERE m.conversation_id = c.id
+                   AND m.sender_id != $1
+                   AND m.created_at > COALESCE(
+                     (SELECT last_read_at FROM conversation_members WHERE conversation_id = c.id AND user_id = $1),
+                     '1970-01-01'::timestamptz
+                   )
+              ) AS unread_count
+       FROM conversations c
+       JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = $1
+       JOIN conversation_members cm2 ON cm2.conversation_id = c.id
+       JOIN users u2 ON u2.id = cm2.user_id
+       GROUP BY c.id
+       ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC`,
+      [req.user.uid]
+    );
+    const convos = result.rows.map((c) => {
+      let displayName = c.name;
+      let online = false;
+      if (c.type === "dm") {
+        const idx = c.member_ids.findIndex((id) => id !== req.user.uid);
+        displayName = c.member_names[idx] || "Direct Message";
+        const otherLastSeen = c.member_last_seen[idx];
+        online = !!otherLastSeen && (Date.now() - new Date(otherLastSeen).getTime()) / 1000 < ONLINE_WINDOW_SECONDS;
+      }
+      return {
+        id: c.id,
+        type: c.type,
+        name: displayName || "Group Chat",
+        lastMessage: c.last_message,
+        unreadCount: parseInt(c.unread_count, 10) || 0,
+        online: online,
+      };
     });
-
-    form.appendChild(sectionEl);
-  });
-
-  function renderField(field) {
-    var wrap = document.createElement("div");
-    wrap.className = "field";
-
-    if (field.type === "singleCheckbox") {
-      var label = document.createElement("label");
-      label.style.display = "flex";
-      label.style.alignItems = "center";
-      label.style.gap = "6px";
-      var cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.id = fieldId(field.key);
-      label.appendChild(cb);
-      label.appendChild(document.createTextNode(field.label));
-      wrap.appendChild(label);
-      return wrap;
-    }
-
-    if (field.type === "note") {
-      var labelEl0 = document.createElement("label");
-      labelEl0.textContent = field.label;
-      wrap.appendChild(labelEl0);
-      var noteEl = document.createElement("div");
-      noteEl.style.fontSize = "10px";
-      noteEl.style.opacity = "0.6";
-      noteEl.style.fontStyle = "italic";
-      noteEl.textContent = field.note;
-      wrap.appendChild(noteEl);
-      return wrap;
-    }
-
-    var labelEl = document.createElement("label");
-    labelEl.textContent = field.label;
-    labelEl.setAttribute("for", fieldId(field.key));
-    wrap.appendChild(labelEl);
-
-    if (field.type === "textarea") {
-      var textarea = document.createElement("textarea");
-      textarea.id = fieldId(field.key);
-      wrap.appendChild(textarea);
-    } else if (field.type === "radio") {
-      var radioGroup = document.createElement("div");
-      radioGroup.className = "radio-row";
-      radioGroup.id = fieldId(field.key);
-      field.options.forEach(function (opt) {
-        var item = document.createElement("label");
-        item.className = "radio-item";
-        var input = document.createElement("input");
-        input.type = "radio";
-        input.name = field.key;
-        input.value = opt;
-        item.appendChild(input);
-        item.appendChild(document.createTextNode(opt));
-        radioGroup.appendChild(item);
-      });
-      wrap.appendChild(radioGroup);
-    } else if (field.type === "checkboxes") {
-      var cbGroup = document.createElement("div");
-      cbGroup.className = "checkbox-grid";
-      cbGroup.id = fieldId(field.key);
-      field.options.forEach(function (opt) {
-        var item = document.createElement("label");
-        item.className = "checkbox-item";
-        var input = document.createElement("input");
-        input.type = "checkbox";
-        input.value = opt;
-        item.appendChild(input);
-        item.appendChild(document.createTextNode(opt));
-        cbGroup.appendChild(item);
-      });
-      wrap.appendChild(cbGroup);
-    } else {
-      var input2 = document.createElement("input");
-      input2.type = field.type;
-      input2.id = fieldId(field.key);
-      wrap.appendChild(input2);
-    }
-    return wrap;
+    res.json(convos);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading conversations: " + e.message });
   }
+});
 
-  // ---- shared: build a clean plain-text summary of every answer ----
-  function buildSummaryText() {
-    var lines = ["A.R.I.E.S. PORTAL — INVESTIGATOR & COMPANY INTAKE FORM", ""];
-    SCHEMA.forEach(function (section) {
-      lines.push(section.title);
-      lines.push("-".repeat(section.title.length));
-      section.fields.forEach(function (field) {
-        if (field.type === "note") return;
-        var value = "";
-        if (field.type === "singleCheckbox") {
-          var cb = document.getElementById(fieldId(field.key));
-          value = cb && cb.checked ? "Yes" : "No";
-        } else if (field.type === "radio") {
-          var checked = document.querySelector('input[name="' + field.key + '"]:checked');
-          value = checked ? checked.value : "(not answered)";
-        } else if (field.type === "checkboxes") {
-          var groupEl = document.getElementById(fieldId(field.key));
-          var checkedBoxes = groupEl.querySelectorAll("input:checked");
-          value = checkedBoxes.length
-            ? Array.prototype.map.call(checkedBoxes, function (b) { return b.value; }).join(", ")
-            : "(none selected)";
-        } else {
-          var el = document.getElementById(fieldId(field.key));
-          value = (el && el.value.trim()) || "(blank)";
-        }
-        lines.push(field.label + ": " + value);
-      });
-      lines.push("");
-    });
-    return lines.join("\n");
+// ---- mark a conversation as read (clears its unread badge) ----
+app.post("/api/conversations/:id/read", requireAuth, async (req, res) => {
+  try {
+    const convoId = req.params.id;
+    await pool.query(
+      `INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (conversation_id, user_id) DO UPDATE SET last_read_at = now()`,
+      [convoId, req.user.uid]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error marking conversation read: " + e.message });
   }
+});
 
-  // ---- print / save as PDF (kept as an optional personal backup copy) ----
-  document.getElementById("printBtn").addEventListener("click", function () {
-    window.print();
-  });
-
-  // ---- submit: sends the completed form straight to A.R.I.E.S. by email ----
-  // =========================================================
-  // Same Render backend as your Message Center / Member Dashboard.
-  // =========================================================
-  var SERVER_URL = "https://aries-message-server.onrender.com";
-  // =========================================================
-
-  document.getElementById("submitBtn").addEventListener("click", function () {
-    var statusEl = document.getElementById("submitStatus");
-    var nameField = document.getElementById(fieldId("investigatorOrCompanyName"));
-    var emailField = document.getElementById(fieldId("primaryContactEmail"));
-    var agreeField = document.getElementById(fieldId("certAgree"));
-
-    if (!nameField.value.trim() || !emailField.value.trim()) {
-      statusEl.style.color = "#ff6b6b";
-      statusEl.textContent = "Please fill in at least your name and contact email before submitting.";
-      return;
+// ---- start a new conversation (DM or group) ----
+app.post("/api/conversations", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { type, memberIds, name } = req.body;
+    if (!type || !Array.isArray(memberIds) || memberIds.length === 0) {
+      return res.status(400).json({ error: "type and memberIds are required." });
     }
-    if (!agreeField.checked) {
-      statusEl.style.color = "#ff6b6b";
-      statusEl.textContent = "Please check the certification box in Section 11 before submitting.";
-      return;
+    const allMembers = Array.from(new Set([...memberIds, req.user.uid]));
+
+    if (type === "dm") {
+      // check for an existing DM between exactly these two people first
+      const existing = await client.query(
+        `SELECT c.id FROM conversations c
+         JOIN conversation_members cm ON cm.conversation_id = c.id
+         WHERE c.type = 'dm' AND cm.user_id = ANY($1::int[])
+         GROUP BY c.id
+         HAVING COUNT(DISTINCT cm.user_id) = $2
+            AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = c.id) = $2`,
+        [allMembers, allMembers.length]
+      );
+      if (existing.rows.length > 0) {
+        return res.json({ id: existing.rows[0].id });
+      }
     }
 
-    statusEl.style.color = "#ffd400";
-    statusEl.textContent = "Submitting… (this can take up to ~30s if the server was asleep)";
+    await client.query("BEGIN");
+    const convoResult = await client.query(
+      "INSERT INTO conversations (type, name) VALUES ($1, $2) RETURNING id",
+      [type, type === "group" ? name || "Group Chat" : null]
+    );
+    const convoId = convoResult.rows[0].id;
+    for (const uid of allMembers) {
+      await client.query(
+        "INSERT INTO conversation_members (conversation_id, user_id) VALUES ($1, $2)",
+        [convoId, uid]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ id: convoId });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    res.status(500).json({ error: "Server error creating conversation: " + e.message });
+  } finally {
+    client.release();
+  }
+});
 
-    var summary = buildSummaryText();
-    var subject = "New A.R.I.E.S. Intake Form — " + nameField.value.trim();
-    var honeypotValue = document.getElementById("honeypot").value;
+// ---- get messages in a conversation (must be a member) ----
+app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
+  try {
+    const convoId = req.params.id;
+    const membership = await pool.query(
+      "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+      [convoId, req.user.uid]
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ error: "You are not a member of this conversation." });
+    }
+    const result = await pool.query(
+      "SELECT id, sender_id, sender_name, text, created_at FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+      [convoId]
+    );
+    res.json(
+      result.rows.map((m) => ({
+        id: m.id,
+        senderId: m.sender_id,
+        senderName: m.sender_name,
+        text: m.text,
+        createdAt: m.created_at,
+      }))
+    );
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading messages: " + e.message });
+  }
+});
 
-    fetch(SERVER_URL + "/api/submit-intake", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        subject: subject,
-        text: summary,
-        replyToEmail: emailField.value.trim(),
-        honeypot: honeypotValue,
-      }),
-    })
-      .then(function (res) {
-        return res.json().then(function (data) {
-          if (!res.ok) throw new Error(data.error || "Submission failed.");
-          return data;
-        });
-      })
-      .then(function () {
-        statusEl.style.color = "#7CFC00";
-        statusEl.textContent = "Submitted! Your completed form has been sent to A.R.I.E.S. Thank you.";
-        document.getElementById("submitBtn").disabled = true;
-      })
-      .catch(function (err) {
-        statusEl.style.color = "#ff6b6b";
-        statusEl.textContent = "Couldn't submit: " + err.message + " — you can still use \"DOWNLOAD PDF\" and email it manually.";
-      });
+// ---- send a message ----
+app.post("/api/conversations/:id/messages", requireAuth, async (req, res) => {
+  try {
+    const convoId = req.params.id;
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "Message text is required." });
+
+    const membership = await pool.query(
+      "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+      [convoId, req.user.uid]
+    );
+    if (membership.rows.length === 0) {
+      return res.status(403).json({ error: "You are not a member of this conversation." });
+    }
+
+    await pool.query(
+      "INSERT INTO messages (conversation_id, sender_id, sender_name, text) VALUES ($1, $2, $3, $4)",
+      [convoId, req.user.uid, req.user.displayName, text.trim()]
+    );
+    await pool.query(
+      "UPDATE conversations SET last_message = $1, last_message_at = now() WHERE id = $2",
+      [text.trim(), convoId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error sending message: " + e.message });
+  }
+});
+
+// ---- account info for the dashboard (email, display name, member since) ----
+app.get("/api/me", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT email, display_name, created_at FROM users WHERE id = $1",
+      [req.user.uid]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found." });
+    const u = result.rows[0];
+    res.json({ email: u.email, displayName: u.display_name, createdAt: u.created_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading account info: " + e.message });
+  }
+});
+
+// ---- private case notes (visible only to the member who wrote them) ----
+app.get("/api/notes", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, text, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC",
+      [req.user.uid]
+    );
+    res.json(result.rows.map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, updatedAt: n.updated_at })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading notes: " + e.message });
+  }
+});
+
+app.post("/api/notes", requireAuth, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "Note text is required." });
+    const result = await pool.query(
+      "INSERT INTO notes (user_id, text) VALUES ($1, $2) RETURNING id, text, created_at, updated_at",
+      [req.user.uid, text.trim()]
+    );
+    const n = result.rows[0];
+    res.json({ id: n.id, text: n.text, createdAt: n.created_at, updatedAt: n.updated_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error creating note: " + e.message });
+  }
+});
+
+app.put("/api/notes/:id", requireAuth, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "Note text is required." });
+    const result = await pool.query(
+      "UPDATE notes SET text = $1, updated_at = now() WHERE id = $2 AND user_id = $3 RETURNING id, text, created_at, updated_at",
+      [text.trim(), req.params.id, req.user.uid]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Note not found." });
+    const n = result.rows[0];
+    res.json({ id: n.id, text: n.text, createdAt: n.created_at, updatedAt: n.updated_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error updating note: " + e.message });
+  }
+});
+
+app.delete("/api/notes/:id", requireAuth, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM notes WHERE id = $1 AND user_id = $2", [req.params.id, req.user.uid]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error deleting note: " + e.message });
+  }
+});
+
+// ---- intake form submission: emails the completed form to the
+// business inbox. No login required — anyone with the intake form's
+// link can submit, matching the existing manual verification process
+// (you match submissions to Stripe notifications by email yourself).
+app.post("/api/submit-intake", async (req, res) => {
+  try {
+    const { subject, text, replyToEmail, honeypot } = req.body;
+
+    // basic spam deterrent: a hidden field real users never fill in
+    if (honeypot) {
+      return res.json({ ok: true }); // pretend success, don't actually send
+    }
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Form content is missing." });
+    }
+
+    const mailOptions = {
+      from: process.env.GMAIL_USER,
+      to: INTAKE_RECIPIENT,
+      subject: subject || "New A.R.I.E.S. Intake Form Submission",
+      text: text,
+    };
+    if (replyToEmail && replyToEmail.trim()) {
+      mailOptions.replyTo = replyToEmail.trim();
+    }
+
+    await mailTransporter.sendMail(mailOptions);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Failed to send intake form email:", e);
+    res.status(500).json({ error: "Server error sending the form: " + e.message });
+  }
+});
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log("Server listening on port " + PORT));
+  })
+  .catch((e) => {
+    console.error("Failed to initialize database:", e);
+    process.exit(1);
   });
-})();
-</script>
