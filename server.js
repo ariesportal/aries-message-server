@@ -69,6 +69,16 @@ async function initDb() {
   // a database that already has the older table shape.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ DEFAULT now();`);
+  // private per-member case notes, added for the member dashboard
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
   console.log("Database tables ready.");
 }
 
@@ -340,6 +350,79 @@ app.post("/api/conversations/:id/messages", requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error sending message: " + e.message });
+  }
+});
+
+// ---- account info for the dashboard (email, display name, member since) ----
+app.get("/api/me", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT email, display_name, created_at FROM users WHERE id = $1",
+      [req.user.uid]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Account not found." });
+    const u = result.rows[0];
+    res.json({ email: u.email, displayName: u.display_name, createdAt: u.created_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading account info: " + e.message });
+  }
+});
+
+// ---- private case notes (visible only to the member who wrote them) ----
+app.get("/api/notes", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, text, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC",
+      [req.user.uid]
+    );
+    res.json(result.rows.map((n) => ({ id: n.id, text: n.text, createdAt: n.created_at, updatedAt: n.updated_at })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading notes: " + e.message });
+  }
+});
+
+app.post("/api/notes", requireAuth, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "Note text is required." });
+    const result = await pool.query(
+      "INSERT INTO notes (user_id, text) VALUES ($1, $2) RETURNING id, text, created_at, updated_at",
+      [req.user.uid, text.trim()]
+    );
+    const n = result.rows[0];
+    res.json({ id: n.id, text: n.text, createdAt: n.created_at, updatedAt: n.updated_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error creating note: " + e.message });
+  }
+});
+
+app.put("/api/notes/:id", requireAuth, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "Note text is required." });
+    const result = await pool.query(
+      "UPDATE notes SET text = $1, updated_at = now() WHERE id = $2 AND user_id = $3 RETURNING id, text, created_at, updated_at",
+      [text.trim(), req.params.id, req.user.uid]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Note not found." });
+    const n = result.rows[0];
+    res.json({ id: n.id, text: n.text, createdAt: n.created_at, updatedAt: n.updated_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error updating note: " + e.message });
+  }
+});
+
+app.delete("/api/notes/:id", requireAuth, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM notes WHERE id = $1 AND user_id = $2", [req.params.id, req.user.uid]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error deleting note: " + e.message });
   }
 });
 
