@@ -31,6 +31,12 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 
+// Render's outbound networking doesn't reliably support IPv6, which can
+// cause "ENETUNREACH" errors connecting to services (like Gmail's SMTP
+// servers) that resolve to an IPv6 address. Forcing IPv4-first DNS
+// resolution avoids that entirely.
+require("dns").setDefaultResultOrder("ipv4first");
+
 const app = express();
 app.use(cors());
 app.use(express.json());
