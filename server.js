@@ -105,6 +105,10 @@ async function initDb() {
   // a database that already has the older table shape.
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ DEFAULT now();`);
+  // per-user "delete chat" — hides a conversation from just this
+  // member's list without affecting other participants. Reappears for
+  // them automatically if a new message arrives (see send-message logic).
+  await pool.query(`ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;`);
   // private per-member case notes, added for the member dashboard
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notes (
@@ -113,6 +117,15 @@ async function initDb() {
       text TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT now(),
       updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  // blocking — blocker_id can't be messaged by / see blocked_id, and vice versa
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      blocked_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (blocker_id, blocked_id)
     );
   `);
   console.log("Database tables ready.");
@@ -203,7 +216,11 @@ app.get("/api/users", requireAuth, async (req, res) => {
     const result = await pool.query(
       `SELECT id, display_name,
               (last_seen IS NOT NULL AND last_seen > now() - interval '${ONLINE_WINDOW_SECONDS} seconds') AS online
-       FROM users WHERE id != $1 ORDER BY display_name ASC`,
+       FROM users
+       WHERE id != $1
+         AND id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = $1)
+         AND id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = $1)
+       ORDER BY display_name ASC`,
       [req.user.uid]
     );
     res.json(result.rows.map((r) => ({ uid: r.id, name: r.display_name, online: r.online })));
@@ -234,6 +251,7 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
        JOIN conversation_members cm ON cm.conversation_id = c.id AND cm.user_id = $1
        JOIN conversation_members cm2 ON cm2.conversation_id = c.id
        JOIN users u2 ON u2.id = cm2.user_id
+       WHERE cm.deleted_at IS NULL
        GROUP BY c.id
        ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC`,
       [req.user.uid]
@@ -241,11 +259,13 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
     const convos = result.rows.map((c) => {
       let displayName = c.name;
       let online = false;
+      let otherUserId = null;
       if (c.type === "dm") {
         const idx = c.member_ids.findIndex((id) => id !== req.user.uid);
         displayName = c.member_names[idx] || "Direct Message";
         const otherLastSeen = c.member_last_seen[idx];
         online = !!otherLastSeen && (Date.now() - new Date(otherLastSeen).getTime()) / 1000 < ONLINE_WINDOW_SECONDS;
+        otherUserId = c.member_ids[idx];
       }
       return {
         id: c.id,
@@ -254,6 +274,7 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
         lastMessage: c.last_message,
         unreadCount: parseInt(c.unread_count, 10) || 0,
         online: online,
+        otherUserId: otherUserId,
       };
     });
     res.json(convos);
@@ -280,6 +301,74 @@ app.post("/api/conversations/:id/read", requireAuth, async (req, res) => {
   }
 });
 
+// ---- delete a chat — hides it from just this member's own list.
+// Other participants are unaffected, and it reappears for this member
+// automatically if a new message arrives later (see send-message below).
+app.post("/api/conversations/:id/delete", requireAuth, async (req, res) => {
+  try {
+    const convoId = req.params.id;
+    const result = await pool.query(
+      "UPDATE conversation_members SET deleted_at = now() WHERE conversation_id = $1 AND user_id = $2",
+      [convoId, req.user.uid]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error deleting conversation: " + e.message });
+  }
+});
+
+// ---- block / unblock a user ----
+app.get("/api/blocks", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.display_name FROM blocks b
+       JOIN users u ON u.id = b.blocked_id
+       WHERE b.blocker_id = $1
+       ORDER BY u.display_name ASC`,
+      [req.user.uid]
+    );
+    res.json(result.rows.map((r) => ({ uid: r.id, name: r.display_name })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading blocked users: " + e.message });
+  }
+});
+
+app.post("/api/users/:id/block", requireAuth, async (req, res) => {
+  try {
+    const blockedId = req.params.id;
+    if (String(blockedId) === String(req.user.uid)) {
+      return res.status(400).json({ error: "You can't block yourself." });
+    }
+    await pool.query(
+      `INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1, $2)
+       ON CONFLICT (blocker_id, blocked_id) DO NOTHING`,
+      [req.user.uid, blockedId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error blocking user: " + e.message });
+  }
+});
+
+app.delete("/api/users/:id/block", requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      "DELETE FROM blocks WHERE blocker_id = $1 AND blocked_id = $2",
+      [req.user.uid, req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error unblocking user: " + e.message });
+  }
+});
+
 // ---- start a new conversation (DM or group) ----
 app.post("/api/conversations", requireAuth, async (req, res) => {
   const client = await pool.connect();
@@ -289,6 +378,18 @@ app.post("/api/conversations", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "type and memberIds are required." });
     }
     const allMembers = Array.from(new Set([...memberIds, req.user.uid]));
+
+    // block check: refuse to create a conversation if any pair among the
+    // requested members has a block between them (covers both directions)
+    const blockCheck = await client.query(
+      `SELECT 1 FROM blocks
+       WHERE (blocker_id = ANY($1::int[]) AND blocked_id = ANY($1::int[]))
+       LIMIT 1`,
+      [allMembers]
+    );
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: "Can't start this conversation — one participant has blocked another." });
+    }
 
     if (type === "dm") {
       // check for an existing DM between exactly these two people first
@@ -374,6 +475,19 @@ app.post("/api/conversations/:id/messages", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "You are not a member of this conversation." });
     }
 
+    // if any OTHER member of this conversation has blocked the sender,
+    // refuse to deliver the message
+    const blockCheck = await pool.query(
+      `SELECT 1 FROM blocks b
+       JOIN conversation_members cm ON cm.user_id = b.blocker_id
+       WHERE cm.conversation_id = $1 AND b.blocked_id = $2
+       LIMIT 1`,
+      [convoId, req.user.uid]
+    );
+    if (blockCheck.rows.length > 0) {
+      return res.status(403).json({ error: "You can't send messages in this conversation." });
+    }
+
     await pool.query(
       "INSERT INTO messages (conversation_id, sender_id, sender_name, text) VALUES ($1, $2, $3, $4)",
       [convoId, req.user.uid, req.user.displayName, text.trim()]
@@ -381,6 +495,13 @@ app.post("/api/conversations/:id/messages", requireAuth, async (req, res) => {
     await pool.query(
       "UPDATE conversations SET last_message = $1, last_message_at = now() WHERE id = $2",
       [text.trim(), convoId]
+    );
+    // a new message un-hides this conversation for anyone who had
+    // previously "deleted" it from their own view — otherwise they'd
+    // silently never see it again
+    await pool.query(
+      "UPDATE conversation_members SET deleted_at = NULL WHERE conversation_id = $1 AND user_id != $2",
+      [convoId, req.user.uid]
     );
     res.json({ ok: true });
   } catch (e) {
