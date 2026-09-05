@@ -403,6 +403,15 @@ app.post("/api/conversations", requireAuth, async (req, res) => {
         [allMembers, allMembers.length]
       );
       if (existing.rows.length > 0) {
+        // reusing an existing conversation — make sure it's not sitting
+        // "deleted" for the person asking (e.g. they deleted this chat
+        // earlier and are now messaging the same person again). Without
+        // this, the frontend gets back an id it can't actually find in
+        // its own conversation list, since deleted ones are filtered out.
+        await client.query(
+          "UPDATE conversation_members SET deleted_at = NULL WHERE conversation_id = $1 AND user_id = $2",
+          [existing.rows[0].id, req.user.uid]
+        );
         return res.json({ id: existing.rows[0].id });
       }
     }
