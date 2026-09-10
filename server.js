@@ -120,6 +120,10 @@ async function initDb() {
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_data TEXT;`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_filename TEXT;`);
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_mime_type TEXT;`);
+  // tracks whether/when a message's text was edited after sending, so
+  // the frontend can show an "(edited)" tag — editing silently with no
+  // trace isn't great for a tool people rely on for accurate records
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;`);
   // the original schema required message text — drop that so an
   // attachment can be sent on its own, with no caption
   await pool.query(`ALTER TABLE messages ALTER COLUMN text DROP NOT NULL;`);
@@ -465,7 +469,7 @@ app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "You are not a member of this conversation." });
     }
     const result = await pool.query(
-      `SELECT id, sender_id, sender_name, text, created_at,
+      `SELECT id, sender_id, sender_name, text, created_at, edited_at,
               attachment_data, attachment_filename, attachment_mime_type
        FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
       [convoId]
@@ -477,6 +481,7 @@ app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
         senderName: m.sender_name,
         text: m.text,
         createdAt: m.created_at,
+        editedAt: m.edited_at,
         attachmentData: m.attachment_data,
         attachmentFilename: m.attachment_filename,
         attachmentMimeType: m.attachment_mime_type,
@@ -485,6 +490,50 @@ app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error loading messages: " + e.message });
+  }
+});
+
+// ---- edit a message's text — only the original sender can do this ----
+app.put("/api/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
+  try {
+    const { id: convoId, messageId } = req.params;
+    const { text } = req.body;
+    const trimmedText = text ? text.trim() : "";
+
+    const existing = await pool.query(
+      "SELECT sender_id, attachment_data FROM messages WHERE id = $1 AND conversation_id = $2",
+      [messageId, convoId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "Message not found." });
+    }
+    if (existing.rows[0].sender_id !== req.user.uid) {
+      return res.status(403).json({ error: "You can only edit your own messages." });
+    }
+    if (!trimmedText && !existing.rows[0].attachment_data) {
+      return res.status(400).json({ error: "A message can't be edited down to nothing." });
+    }
+
+    const updated = await pool.query(
+      "UPDATE messages SET text = $1, edited_at = now() WHERE id = $2 RETURNING created_at",
+      [trimmedText || null, messageId]
+    );
+
+    // keep the conversation list preview accurate if this was the most
+    // recent message in the conversation
+    const latest = await pool.query(
+      "SELECT id FROM messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [convoId]
+    );
+    if (latest.rows.length > 0 && String(latest.rows[0].id) === String(messageId)) {
+      const previewText = trimmedText || (existing.rows[0].attachment_data ? "📎 attachment" : "");
+      await pool.query("UPDATE conversations SET last_message = $1 WHERE id = $2", [previewText, convoId]);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error editing message: " + e.message });
   }
 });
 
