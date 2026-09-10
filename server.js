@@ -39,7 +39,11 @@ require("dns").setDefaultResultOrder("ipv4first");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// default body limit is 100kb — far too small for file attachments
+// (base64-encoded images/files), so this raises it. Combined with the
+// MAX_ATTACHMENT_BYTES check below, this keeps individual messages
+// reasonably sized while still allowing real photos/documents through.
+app.use(express.json({ limit: "12mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-in-render-env-vars";
 const PORT = process.env.PORT || 3000;
@@ -109,6 +113,16 @@ async function initDb() {
   // member's list without affecting other participants. Reappears for
   // them automatically if a new message arrives (see send-message logic).
   await pool.query(`ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;`);
+  // file/image attachments — stored as base64 directly in the row.
+  // Simple and needs no extra infrastructure (no S3/Cloudinary signup),
+  // at the cost of not scaling well to huge files or heavy volume —
+  // fine for a team messaging tool, worth revisiting if usage grows a lot.
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_data TEXT;`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_filename TEXT;`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_mime_type TEXT;`);
+  // the original schema required message text — drop that so an
+  // attachment can be sent on its own, with no caption
+  await pool.query(`ALTER TABLE messages ALTER COLUMN text DROP NOT NULL;`);
   // private per-member case notes, added for the member dashboard
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notes (
@@ -451,7 +465,9 @@ app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
       return res.status(403).json({ error: "You are not a member of this conversation." });
     }
     const result = await pool.query(
-      "SELECT id, sender_id, sender_name, text, created_at FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+      `SELECT id, sender_id, sender_name, text, created_at,
+              attachment_data, attachment_filename, attachment_mime_type
+       FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
       [convoId]
     );
     res.json(
@@ -461,6 +477,9 @@ app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
         senderName: m.sender_name,
         text: m.text,
         createdAt: m.created_at,
+        attachmentData: m.attachment_data,
+        attachmentFilename: m.attachment_filename,
+        attachmentMimeType: m.attachment_mime_type,
       }))
     );
   } catch (e) {
@@ -469,12 +488,29 @@ app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
   }
 });
 
-// ---- send a message ----
+// max size for an attachment's base64 payload. This is checked against
+// the base64 STRING length, which runs ~33% larger than the actual file
+// size — 10.9m chars here caps the real file at roughly 8MB.
+const MAX_ATTACHMENT_BASE64_CHARS = 10.9 * 1024 * 1024;
+
+// ---- send a message (text, an attachment, or both) ----
 app.post("/api/conversations/:id/messages", requireAuth, async (req, res) => {
   try {
     const convoId = req.params.id;
-    const { text } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: "Message text is required." });
+    const { text, attachmentData, attachmentFilename, attachmentMimeType } = req.body;
+    const trimmedText = text ? text.trim() : "";
+
+    if (!trimmedText && !attachmentData) {
+      return res.status(400).json({ error: "Message text or an attachment is required." });
+    }
+    if (attachmentData) {
+      if (!attachmentFilename || !attachmentMimeType) {
+        return res.status(400).json({ error: "Attachment filename and type are required." });
+      }
+      if (attachmentData.length > MAX_ATTACHMENT_BASE64_CHARS) {
+        return res.status(413).json({ error: "That file is too large — please keep attachments under 8MB." });
+      }
+    }
 
     const membership = await pool.query(
       "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
@@ -498,12 +534,17 @@ app.post("/api/conversations/:id/messages", requireAuth, async (req, res) => {
     }
 
     await pool.query(
-      "INSERT INTO messages (conversation_id, sender_id, sender_name, text) VALUES ($1, $2, $3, $4)",
-      [convoId, req.user.uid, req.user.displayName, text.trim()]
+      `INSERT INTO messages
+         (conversation_id, sender_id, sender_name, text, attachment_data, attachment_filename, attachment_mime_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [convoId, req.user.uid, req.user.displayName, trimmedText || null, attachmentData || null, attachmentFilename || null, attachmentMimeType || null]
     );
+    // preview text shown in the conversation list — falls back to
+    // naming the file when there's no caption text
+    const previewText = trimmedText || (attachmentFilename ? "📎 " + attachmentFilename : "");
     await pool.query(
       "UPDATE conversations SET last_message = $1, last_message_at = now() WHERE id = $2",
-      [text.trim(), convoId]
+      [previewText, convoId]
     );
     // a new message un-hides this conversation for anyone who had
     // previously "deleted" it from their own view — otherwise they'd
