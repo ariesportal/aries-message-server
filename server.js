@@ -537,6 +537,44 @@ app.put("/api/conversations/:id/messages/:messageId", requireAuth, async (req, r
   }
 });
 
+// ---- delete a single message — only the original sender can do this.
+// This is a hard delete (removes the row entirely), unlike "delete chat"
+// which only hides a conversation from one person's own view.
+app.delete("/api/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
+  try {
+    const { id: convoId, messageId } = req.params;
+
+    const existing = await pool.query(
+      "SELECT sender_id FROM messages WHERE id = $1 AND conversation_id = $2",
+      [messageId, convoId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "Message not found." });
+    }
+    if (existing.rows[0].sender_id !== req.user.uid) {
+      return res.status(403).json({ error: "You can only delete your own messages." });
+    }
+
+    await pool.query("DELETE FROM messages WHERE id = $1", [messageId]);
+
+    // if that was the most recent message, update the conversation's
+    // preview to whatever is now the actual latest message (or blank)
+    const latest = await pool.query(
+      "SELECT text, attachment_filename FROM messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [convoId]
+    );
+    const previewText = latest.rows.length > 0
+      ? (latest.rows[0].text || (latest.rows[0].attachment_filename ? "📎 " + latest.rows[0].attachment_filename : ""))
+      : "";
+    await pool.query("UPDATE conversations SET last_message = $1 WHERE id = $2", [previewText, convoId]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error deleting message: " + e.message });
+  }
+});
+
 // max size for an attachment's base64 payload. This is checked against
 // the base64 STRING length, which runs ~33% larger than the actual file
 // size — 10.9m chars here caps the real file at roughly 8MB.
