@@ -754,6 +754,39 @@ app.post("/api/submit-intake", async (req, res) => {
   }
 });
 
+// ---- job posting submission: emails the completed posting to the
+// business inbox for review, same manual-approval pattern as the
+// intake form. No login required.
+app.post("/api/submit-job", async (req, res) => {
+  try {
+    const { subject, text, replyToEmail, honeypot } = req.body;
+
+    // basic spam deterrent: a hidden field real users never fill in
+    if (honeypot) {
+      return res.json({ ok: true }); // pretend success, don't actually send
+    }
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Job posting content is missing." });
+    }
+
+    const mailOptions = {
+      from: process.env.GMAIL_USER,
+      to: INTAKE_RECIPIENT,
+      subject: subject || "New A.R.I.E.S. Job Board Submission",
+      text: text,
+    };
+    if (replyToEmail && replyToEmail.trim()) {
+      mailOptions.replyTo = replyToEmail.trim();
+    }
+
+    await mailTransporter.sendMail(mailOptions);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Failed to send job posting email:", e);
+    res.status(500).json({ error: "Server error sending the submission: " + e.message });
+  }
+});
+
 initDb()
   .then(() => {
     app.listen(PORT, () => console.log("Server listening on port " + PORT));
