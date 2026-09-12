@@ -787,6 +787,76 @@ app.post("/api/submit-job", async (req, res) => {
   }
 });
 
+// ---- job application submission: emails the application, with an
+// optional resume attachment, directly to the employer's contact email
+// captured on that job listing. Reply-To is set to the applicant so the
+// employer can respond straight to them. A.R.I.E.S. is CC'd so there's
+// a record of applications going through, without being the bottleneck.
+app.post("/api/submit-job-application", async (req, res) => {
+  try {
+    const {
+      jobTitle, company, employerEmail,
+      applicantName, applicantEmail, applicantPhone, coverMessage,
+      resumeData, resumeFilename, honeypot,
+    } = req.body;
+
+    if (honeypot) {
+      return res.json({ ok: true }); // pretend success, don't actually send
+    }
+    if (!employerEmail || !employerEmail.trim()) {
+      return res.status(400).json({ error: "This listing has no employer contact email on file — it can't accept applications through A.R.I.E.S." });
+    }
+    if (!applicantName || !applicantName.trim() || !applicantEmail || !applicantEmail.trim()) {
+      return res.status(400).json({ error: "Your name and email are required." });
+    }
+    if (resumeData && resumeData.length > MAX_ATTACHMENT_BASE64_CHARS) {
+      return res.status(413).json({ error: "That resume file is too large — please keep it under 8MB." });
+    }
+
+    const bodyLines = [
+      `New application via A.R.I.E.S. for: ${jobTitle || "(untitled listing)"}${company ? " at " + company : ""}`,
+      "",
+      `Applicant: ${applicantName.trim()}`,
+      `Email: ${applicantEmail.trim()}`,
+      `Phone: ${applicantPhone && applicantPhone.trim() ? applicantPhone.trim() : "(not provided)"}`,
+      "",
+      "Message:",
+      coverMessage && coverMessage.trim() ? coverMessage.trim() : "(no message included)",
+    ];
+
+    const mailOptions = {
+      from: process.env.GMAIL_USER,
+      to: employerEmail.trim(),
+      cc: INTAKE_RECIPIENT,
+      replyTo: applicantEmail.trim(),
+      subject: `A.R.I.E.S. Job Application — ${applicantName.trim()} for ${jobTitle || "your listing"}`,
+      text: bodyLines.join("\n"),
+    };
+
+    if (resumeData) {
+      if (!resumeFilename) {
+        return res.status(400).json({ error: "Resume filename is missing." });
+      }
+      // resumeData arrives as a full data URL ("data:application/pdf;base64,....") —
+      // nodemailer's attachment "content" wants just the base64 payload itself
+      const base64Payload = resumeData.split(",").pop();
+      mailOptions.attachments = [
+        {
+          filename: resumeFilename,
+          content: base64Payload,
+          encoding: "base64",
+        },
+      ];
+    }
+
+    await mailTransporter.sendMail(mailOptions);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Failed to send job application email:", e);
+    res.status(500).json({ error: "Server error sending your application: " + e.message });
+  }
+});
+
 initDb()
   .then(() => {
     app.listen(PORT, () => console.log("Server listening on port " + PORT));
